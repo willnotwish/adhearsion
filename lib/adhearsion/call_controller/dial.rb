@@ -52,6 +52,7 @@ module Adhearsion
         dial.run
         dial.await_completion
         dial.cleanup_calls
+        dial.handle_transfers
         dial.status
       end
 
@@ -85,6 +86,21 @@ module Adhearsion
           place_calls
         end
 
+        def handle_transfers
+          while waiter = @call[:transferred_to]
+            logger.debug "#handle_transfers. Call was transferred to #{waiter}"
+            @call[:transferred_to] = nil
+
+            target = Adhearsion.active_calls[waiter]
+            if target && target.active?
+              logger.info "Transfer target #{waiter} is active. About to wait on it"
+              @call.wait_for_unjoined waiter
+            else
+              logger.warn "Transfer target #{waiter} is no longer active, so transfer cannot take place"
+            end
+          end
+        end
+
         def track_originating_call
           @call.on_end { |_| @latch.countdown! until @latch.count == 0 }
         end
@@ -110,8 +126,21 @@ module Adhearsion
               end
 
               new_call.on_unjoined @call do |unjoined|
+                logger.info "#dial received unjoined event in #prep_calls. transfer_disposition: #{unjoined.transfer_disposition}. transfer_to: #{unjoined.transfer_to}. Outbound call: #{new_call.id}. Originating call: #{@call.id}. Event: #{unjoined.inspect}"
+
+                if unjoined.transfer_disposition == 'recv_replace'
+                  logger.warn "#on_unjoined EXPERIMENTAL. transfer_disposition is recv_replace. Outbound call #{new_call.id} will be replaced by #{unjoined.transfer_to}"
+                  @call[:transferred_to] = unjoined.transfer_to
+                end
+
                 new_call["dial_countdown_#{@call.id}"] = true
                 @latch.countdown!
+              end
+
+              new_call.on_unjoined :transfer_disposition => 'bridge' do |unjoined|
+                logger.warn "#on_unjoined with transfer_disposition of 'bridge'. EXPERIMENTAL. Setting transfer_target in call #{new_call.id} properties to prevent hangup"
+                new_call[:transfer_target] = true
+                throw :pass
               end
 
               if @confirmation_controller
@@ -148,10 +177,16 @@ module Adhearsion
         end
 
         def cleanup_calls
-          logger.debug "#dial finished. Hanging up #{@calls.size} outbound calls: #{@calls.map(&:id).join ", "}."
+          logger.debug "#dial finished. Maybe hanging up #{@calls.size} outbound calls: #{@calls.map(&:id).join ", "}."
           @calls.each do |outbound_call|
             begin
-              outbound_call.hangup
+              if outbound_call[:transfer_target]
+                logger.debug "Not hanging up #{outbound_call.id} as it's a transfer target"
+                outbound_call[:transfer_target] = false
+              else
+                logger.debug "Hanging up #{outbound_call.id} as it's *not* a transfer target"
+                outbound_call.hangup
+              end
             rescue Celluloid::DeadActorError
               # This actor may previously have been shut down due to the call ending
             end
